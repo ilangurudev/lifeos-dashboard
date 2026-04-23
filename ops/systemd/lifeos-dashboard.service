@@ -1,0 +1,16 @@
+[Unit]
+Description=LifeOS dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ilangurudev/projects/lifeos-dashboard
+Environment=PORT=3007
+Environment=LIFEOS_ROOT=/home/ilangurudev/my-data
+ExecStart=/home/ilangurudev/projects/lifeos-dashboard/scripts/run-service.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
