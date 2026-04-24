@@ -1,13 +1,16 @@
 import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { BrowserRouter, Link, NavLink, Route, Routes, useParams, useSearchParams } from 'react-router-dom'
+import { BrowserRouter, Link, NavLink, Route, Routes, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { formatDashboardDate } from './dateFormat'
 import './index.css'
 
-type TaskSection = 'overdue' | 'dueSoon' | 'inProgress' | 'blocked' | 'active' | 'done'
-type TaskFilter = 'all' | 'overdue' | 'dueSoon' | 'recurring' | 'inProgress' | 'active'
-type DashboardView = 'home' | 'tasks' | 'projects' | 'notes' | 'people' | 'goals' | 'checkIns' | 'journal'
-type DashboardCollection = 'tasks' | 'projects' | 'notes' | 'people' | 'goals' | 'checkIns' | 'journal'
+type TaskSection = 'overdue' | 'dueSoon' | 'blocked' | 'active' | 'done'
+type CalendarBucket = 'today' | 'tomorrow' | 'upcomingWeek' | 'oneToThreeWeeks' | 'moreThanMonth' | 'unscheduled'
+type DateBasis = 'reminder' | 'due' | 'none'
+type TaskFilter = 'calendar' | 'overdue' | 'dueSoon' | 'recurring' | 'allActive'
+type DashboardView = 'home' | 'tasks' | 'projects' | 'notes' | 'people' | 'goals' | 'checkIns' | 'journal' | 'agentNotes'
+type DashboardCollection = 'tasks' | 'projects' | 'notes' | 'people' | 'goals' | 'checkIns' | 'journal' | 'agentNotes'
 
 type Task = {
   id: string
@@ -22,7 +25,13 @@ type Task = {
   project: string | null
   dueDate: string
   dueAt: string | null
+  reminderAt: string | null
+  completedAt: string | null
+  nextActionAt: string | null
+  dateBasis: DateBasis
+  calendarBucket: CalendarBucket
   nextReminderTime: string
+  completedTime: string
   updated: string
   tags: string[]
   link: string
@@ -37,6 +46,7 @@ type ProjectTaskPreview = {
   priority: string
   dueDate: string
   dueAt: string | null
+  nextActionAt: string | null
   section: TaskSection
 }
 
@@ -63,12 +73,26 @@ type CollectionNote = {
   id: string
   slug: string
   title: string
-  folder: Exclude<DashboardCollection, 'tasks' | 'projects'>
+  folder: string
   type: string
   status: string
   updated: string
   tags: string[]
   link: string
+  relativePath: string
+  appPath: string
+}
+
+type AgentNote = CollectionNote & {
+  sectionId: string
+  sectionLabel: string
+}
+
+type AgentNotesPayload = {
+  enabled: boolean
+  label: string
+  count: number
+  sections: Array<{ id: string; label: string; notes: AgentNote[] }>
 }
 
 type DashboardPayload = {
@@ -88,7 +112,8 @@ type DashboardPayload = {
   tasks: Task[]
   recurringTasks: Task[]
   projects: Project[]
-  collections: Record<Exclude<DashboardCollection, 'tasks' | 'projects'>, CollectionNote[]>
+  collections: Record<Exclude<DashboardCollection, 'tasks' | 'projects' | 'agentNotes'>, CollectionNote[]>
+  agentNotes: AgentNotesPayload
 }
 
 type FrontmatterEntry = {
@@ -111,6 +136,14 @@ type NoteDetail = {
   appLink: string
   frontmatter: FrontmatterEntry[]
   markdown: string
+  relativePath: string
+}
+
+type ChatSubject = {
+  title: string
+  slug?: string
+  relativePath?: string
+  isGeneral?: boolean
 }
 
 type HermesActivityKind = 'status' | 'thinking' | 'tool_call' | 'tool_result' | 'log'
@@ -164,15 +197,14 @@ type StoredChatState = {
 }
 
 const taskFilterOptions: Array<{ key: TaskFilter; label: string; empty: string }> = [
-  { key: 'all', label: 'All active', empty: 'No active tasks right now.' },
+  { key: 'calendar', label: 'Calendar', empty: 'No scheduled tasks found.' },
   { key: 'overdue', label: 'Overdue', empty: 'No overdue tasks.' },
   { key: 'dueSoon', label: 'Due soon', empty: 'Nothing due soon.' },
   { key: 'recurring', label: 'Recurring', empty: 'No recurring tasks found.' },
-  { key: 'inProgress', label: 'In progress', empty: 'No tasks are in progress.' },
-  { key: 'active', label: 'Other active', empty: 'No other active tasks.' },
+  { key: 'allActive', label: 'All active', empty: 'No active tasks right now.' },
 ]
 
-const dashboardViews: Array<{ key: DashboardView; label: string; collection?: DashboardCollection }> = [
+const dashboardViews: Array<{ key: DashboardView; label: string; collection?: DashboardCollection; system?: boolean }> = [
   { key: 'home', label: 'Home', collection: 'tasks' },
   { key: 'tasks', label: 'Tasks', collection: 'tasks' },
   { key: 'projects', label: 'Projects', collection: 'projects' },
@@ -181,6 +213,7 @@ const dashboardViews: Array<{ key: DashboardView; label: string; collection?: Da
   { key: 'goals', label: 'Goals', collection: 'goals' },
   { key: 'checkIns', label: 'Check-ins', collection: 'checkIns' },
   { key: 'journal', label: 'Journal', collection: 'journal' },
+  { key: 'agentNotes', label: 'Agent Notes', collection: 'agentNotes', system: true },
 ]
 
 const VISIBLE_FRONTMATTER_KEYS = new Set(['type', 'status', 'updated', 'tags', 'project'])
@@ -191,7 +224,9 @@ function App() {
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<DashboardHome />} />
+        <Route path="/chat" element={<GeneralChatPage />} />
         <Route path="/note/:slug" element={<NoteDetailPage />} />
+        <Route path="/note-path" element={<NoteDetailPage />} />
       </Routes>
     </BrowserRouter>
   )
@@ -201,13 +236,33 @@ function chatStorageKey(slug: string) {
   return `${CHAT_STORAGE_PREFIX}${slug}`
 }
 
+function cleanDisplayUserMessage(content: string) {
+  const marker = 'User message:'
+  const markerIndex = content.lastIndexOf(marker)
+  if (markerIndex === -1) return content
+  return content.slice(markerIndex + marker.length).trim()
+}
+
+function normalizeStoredChatState(state: StoredChatState): StoredChatState {
+  return {
+    ...state,
+    messages: (state.messages ?? []).map((message) => ({
+      ...message,
+      content: message.role === 'user' ? cleanDisplayUserMessage(message.content) : message.content,
+    })),
+    activity: state.activity ?? [],
+    error: state.error ?? null,
+    isSending: Boolean(state.isSending),
+  }
+}
+
 function readStoredChatState(slug: string): StoredChatState | null {
   if (typeof window === 'undefined') return null
 
   try {
     const raw = window.localStorage.getItem(chatStorageKey(slug))
     if (!raw) return null
-    return JSON.parse(raw) as StoredChatState
+    return normalizeStoredChatState(JSON.parse(raw) as StoredChatState)
   } catch {
     return null
   }
@@ -246,6 +301,24 @@ function mergeRecoveredMessages(current: ChatMessage[], recovered: Array<Pick<Ch
   return hydrateSessionMessages(recovered)
 }
 
+function composeChatFeed(chatMessages: ChatMessage[], activity: ActivityEntry[]): ChatFeedEntry[] {
+  const activityEntries: ChatFeedEntry[] = activity.map((entry) => ({
+    id: entry.id,
+    role: 'activity',
+    kind: entry.kind,
+    content: entry.message,
+  }))
+
+  if (chatMessages.length === 0) return activityEntries
+
+  const lastUserIndex = chatMessages.map((message) => message.role).lastIndexOf('user')
+  if (lastUserIndex === -1) return [...activityEntries, ...chatMessages]
+
+  const messagesBeforeAndIncludingUser = chatMessages.slice(0, lastUserIndex + 1)
+  const messagesAfterUser = chatMessages.slice(lastUserIndex + 1)
+  return [...messagesBeforeAndIncludingUser, ...activityEntries, ...messagesAfterUser]
+}
+
 function hasActivityMessage(activity: ActivityEntry[], text: string) {
   return activity.some((entry) => entry.message === text)
 }
@@ -275,8 +348,13 @@ function LifeOsChrome({
   return (
     <div className="lifeos-chrome">
       <header className="dashboard-header">
-        <Link to="/" aria-label="LifeOS home">
+        <Link className="brand-lockup" to="/" aria-label="LifeOS home">
+          <LifeOsLogo className="site-logo" />
           <h1>LifeOS</h1>
+        </Link>
+        <Link className="header-chat-link" to="/chat" aria-label="Start a fresh Hermes chat">
+          <LifeOsLogo className="chat-logo-mark" />
+          <span>Chat</span>
         </Link>
       </header>
 
@@ -284,7 +362,7 @@ function LifeOsChrome({
         {dashboardViews.map((entry) => {
           const count = entry.collection && counts ? counts[entry.collection] : undefined
           const isActive = activeView === entry.key
-          const className = isActive ? 'view-chip active' : 'view-chip'
+          const className = ['view-chip', entry.system ? 'system-chip' : '', isActive ? 'active' : ''].filter(Boolean).join(' ')
 
           if (onViewChange) {
             return (
@@ -307,10 +385,14 @@ function LifeOsChrome({
   )
 }
 
+function LifeOsLogo({ className = '' }: { className?: string }) {
+  return <img className={className} src="/lifeos-logo.svg?v=3" alt="LifeOS logo" draggable="false" />
+}
+
 function DashboardHome() {
   const [searchParams, setSearchParams] = useSearchParams()
   const view = parseDashboardView(searchParams.get('view'))
-  const [taskFilter, setTaskFilter] = useState<TaskFilter>('all')
+  const [taskFilter, setTaskFilter] = useState<TaskFilter>('calendar')
   const [data, setData] = useState<DashboardPayload | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -379,7 +461,9 @@ function DashboardHome() {
 
           {view === 'projects' ? <ProjectsView projects={data.projects} /> : null}
 
-          {view !== 'home' && view !== 'tasks' && view !== 'projects' ? (
+          {view === 'agentNotes' ? <AgentNotesView agentNotes={data.agentNotes} /> : null}
+
+          {view !== 'home' && view !== 'tasks' && view !== 'projects' && view !== 'agentNotes' ? (
             <DefaultCollectionView view={view} count={data.contentCounts[viewToCollection(view)]} notes={data.collections[viewToCollectionCardsKey(view)]} />
           ) : null}
         </>
@@ -388,9 +472,253 @@ function DashboardHome() {
   )
 }
 
+function GeneralChatPage() {
+  const navigate = useNavigate()
+  const subject: ChatSubject = useMemo(() => ({ title: 'Fresh chat', isGeneral: true }), [])
+  const initialStoredChat = useMemo(() => readStoredChatState('general'), [])
+  const [chatInput, setChatInput] = useState('')
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(initialStoredChat?.messages ?? [])
+  const [activity, setActivity] = useState<ActivityEntry[]>(initialStoredChat?.activity ?? [])
+  const [chatSessionId, setChatSessionId] = useState<string | null>(initialStoredChat?.sessionId ?? null)
+  const [isSending, setIsSending] = useState(initialStoredChat?.isSending ?? false)
+  const [chatError, setChatError] = useState<string | null>(initialStoredChat?.error ?? null)
+  const streamAbortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => {
+    writeStoredChatState('general', {
+      sessionId: chatSessionId,
+      messages: chatMessages,
+      activity,
+      error: chatError,
+      isSending,
+    })
+  }, [activity, chatError, chatMessages, chatSessionId, isSending])
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = previousOverflow
+      streamAbortRef.current?.abort()
+    }
+  }, [])
+
+  const recoverChatSession = useCallback(async (reason: 'startup' | 'wake' | 'poll' | 'stream-error' = 'poll', sessionOverride?: string | null) => {
+    const sessionToRecover = sessionOverride ?? chatSessionId
+    if (!sessionToRecover) return
+
+    try {
+      const response = await fetch(`/api/hermes/chat/session/${encodeURIComponent(sessionToRecover)}`)
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null
+        throw new Error(payload?.error || 'Could not recover Hermes session')
+      }
+
+      const snapshot = (await response.json()) as HermesSessionSnapshot
+      setChatSessionId(snapshot.sessionId)
+      setChatMessages((current) => mergeRecoveredMessages(current, snapshot.messages))
+
+      if (snapshot.status === 'running') {
+        setIsSending(true)
+        if (reason !== 'poll') {
+          setActivity((current) => appendRecoveryActivity(current, 'Recovered the session. Hermes is still running in the background.'))
+        }
+        setChatError(null)
+        return
+      }
+
+      if (snapshot.status === 'finished') {
+        setIsSending(false)
+        setChatError(null)
+        if (reason !== 'poll') {
+          setActivity((current) => appendRecoveryActivity(current, 'Reconnected cleanly and loaded the finished session.'))
+        }
+        return
+      }
+
+      if (snapshot.status === 'failed') {
+        setIsSending(false)
+        setChatError(snapshot.error || 'Hermes session failed.')
+      }
+    } catch (err) {
+      if (reason !== 'poll') {
+        setChatError(err instanceof Error ? err.message : 'Could not recover Hermes session')
+      }
+    }
+  }, [chatSessionId])
+
+  useEffect(() => {
+    if (!chatSessionId || !isSending) return undefined
+
+    const maybeRecover = () => {
+      if (document.visibilityState === 'visible') {
+        void recoverChatSession('wake')
+      }
+    }
+
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void recoverChatSession('poll')
+      }
+    }, 5000)
+
+    window.addEventListener('focus', maybeRecover)
+    document.addEventListener('visibilitychange', maybeRecover)
+
+    return () => {
+      window.clearInterval(intervalId)
+      window.removeEventListener('focus', maybeRecover)
+      document.removeEventListener('visibilitychange', maybeRecover)
+    }
+  }, [chatSessionId, isSending, recoverChatSession])
+
+  const chatFeed = useMemo<ChatFeedEntry[]>(() => composeChatFeed(chatMessages, activity), [activity, chatMessages])
+
+  async function handleChatSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const message = chatInput.trim()
+    if (!message || isSending) return
+
+    const userMessage: ChatMessage = {
+      id: `${Date.now()}-user`,
+      role: 'user',
+      content: message,
+    }
+
+    setChatMessages((current) => [...current, userMessage])
+    setChatInput('')
+    setChatError(null)
+    setActivity([createActivityEntry('status', 'Queued your request. Booting Hermes…')])
+    setIsSending(true)
+
+    const abortController = new AbortController()
+    streamAbortRef.current?.abort()
+    streamAbortRef.current = abortController
+    let activeSession = chatSessionId
+
+    try {
+      const response = await fetch('/api/hermes/chat/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message, sessionId: chatSessionId }),
+        signal: abortController.signal,
+      })
+
+      if (!response.ok || !response.body) {
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null
+        throw new Error(payload?.error || 'Hermes did not answer')
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line.trim()) continue
+          const eventPayload = JSON.parse(line) as HermesStreamEvent
+
+          if (eventPayload.type === 'session') {
+            activeSession = eventPayload.sessionId
+            setChatSessionId(eventPayload.sessionId)
+            continue
+          }
+
+          if (eventPayload.type === 'activity') {
+            setActivity((current) => [...current, createActivityEntry(eventPayload.kind, eventPayload.message)])
+            continue
+          }
+
+          if (eventPayload.type === 'status') {
+            setActivity((current) => [...current, createActivityEntry('status', eventPayload.message)])
+            continue
+          }
+
+          if (eventPayload.type === 'result') {
+            if (eventPayload.sessionId) {
+              activeSession = eventPayload.sessionId
+              setChatSessionId(eventPayload.sessionId)
+            }
+            setActivity((current) => current.filter((entry) => entry.message !== 'Wrapping up reply…'))
+            setChatMessages((current) => [
+              ...current,
+              {
+                id: `${Date.now()}-assistant`,
+                role: 'assistant',
+                content: eventPayload.reply || 'Hermes finished but came back with no text. Amazing work, king.',
+              },
+            ])
+            continue
+          }
+
+          if (eventPayload.type === 'error') {
+            throw new Error(eventPayload.message)
+          }
+        }
+      }
+      setChatError(null)
+      setIsSending(false)
+    } catch (err) {
+      if (abortController.signal.aborted) return
+
+      if (activeSession) {
+        setChatSessionId(activeSession)
+        setIsSending(true)
+        setChatError(null)
+        setActivity((current) => appendRecoveryActivity(current, 'Live feed dropped. Recovering from the saved session…'))
+        await recoverChatSession('stream-error', activeSession)
+      } else {
+        setChatError(err instanceof Error ? err.message : 'Hermes blew a fuse')
+        setIsSending(false)
+      }
+    } finally {
+      if (streamAbortRef.current === abortController) {
+        streamAbortRef.current = null
+      }
+    }
+  }
+
+  function clearChat() {
+    streamAbortRef.current?.abort()
+    setChatInput('')
+    setChatMessages([])
+    setActivity([])
+    setChatSessionId(null)
+    setChatError(null)
+    setIsSending(false)
+    if (typeof window !== 'undefined') window.localStorage.removeItem(chatStorageKey('general'))
+  }
+
+  return (
+    <main className="app-shell detail-shell">
+      <LifeOsChrome />
+      <ChatModal
+        subject={subject}
+        input={chatInput}
+        feed={chatFeed}
+        isSending={isSending}
+        sessionId={chatSessionId}
+        error={chatError}
+        onClose={() => navigate('/')}
+        onClear={clearChat}
+        onInputChange={setChatInput}
+        onSubmit={handleChatSubmit}
+      />
+    </main>
+  )
+}
+
 function NoteDetailPage() {
   const { slug } = useParams<{ slug: string }>()
   const [searchParams, setSearchParams] = useSearchParams()
+  const relativePathParam = searchParams.get('path')
   const [note, setNote] = useState<NoteDetail | null>(null)
 
   const [loading, setLoading] = useState(true)
@@ -410,7 +738,7 @@ function NoteDetailPage() {
     let cancelled = false
 
     async function load() {
-      if (!slug) {
+      if (!slug && !relativePathParam) {
         if (!cancelled) {
           setNote(null)
           setError('Could not find that note.')
@@ -421,11 +749,14 @@ function NoteDetailPage() {
 
       try {
         setLoading(true)
-        const response = await fetch(`/api/note/${encodeURIComponent(slug)}`)
+        const noteUrl = relativePathParam
+          ? `/api/note-path?path=${encodeURIComponent(relativePathParam)}`
+          : `/api/note/${encodeURIComponent(slug ?? '')}`
+        const response = await fetch(noteUrl)
         if (!response.ok) throw new Error(response.status === 404 ? 'Could not find that note.' : 'Could not load note view')
         const payload = (await response.json()) as NoteDetail
         if (!cancelled) {
-          const restored = readStoredChatState(slug)
+          const restored = readStoredChatState(payload.relativePath || payload.slug)
           setNote(payload)
           setError(null)
           setChatMessages(restored?.messages ?? [])
@@ -451,7 +782,7 @@ function NoteDetailPage() {
       cancelled = true
       streamAbortRef.current?.abort()
     }
-  }, [slug])
+  }, [relativePathParam, slug])
 
   useEffect(() => {
     if (!isChatOpen) return undefined
@@ -463,15 +794,16 @@ function NoteDetailPage() {
   }, [isChatOpen])
 
   useEffect(() => {
-    if (!slug) return
-    writeStoredChatState(slug, {
+    const storageSlug = note?.relativePath || slug
+    if (!storageSlug) return
+    writeStoredChatState(storageSlug, {
       sessionId: chatSessionId,
       messages: chatMessages,
       activity,
       error: chatError,
       isSending,
     })
-  }, [activity, chatError, chatMessages, chatSessionId, isSending, slug])
+  }, [activity, chatError, chatMessages, chatSessionId, isSending, note?.relativePath, slug])
 
   const recoverChatSession = useCallback(async (reason: 'startup' | 'wake' | 'poll' | 'stream-error' = 'poll', sessionOverride?: string | null) => {
     const sessionToRecover = sessionOverride ?? chatSessionId
@@ -549,16 +881,7 @@ function NoteDetailPage() {
 
   const visibleFrontmatter = (note?.frontmatter ?? []).filter((entry) => !VISIBLE_FRONTMATTER_KEYS.has(entry.key))
 
-  const chatFeed = useMemo<ChatFeedEntry[]>(() => {
-    const activityEntries: ChatFeedEntry[] = activity.map((entry) => ({
-      id: entry.id,
-      role: 'activity',
-      kind: entry.kind,
-      content: entry.message,
-    }))
-
-    return [...chatMessages, ...activityEntries].sort((a, b) => a.id.localeCompare(b.id))
-  }, [activity, chatMessages])
+  const chatFeed = useMemo<ChatFeedEntry[]>(() => composeChatFeed(chatMessages, activity), [activity, chatMessages])
 
   function openChatModal() {
     setIsChatManuallyOpen(true)
@@ -602,6 +925,7 @@ function NoteDetailPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           noteSlug: note.slug,
+          notePath: note.relativePath,
           message,
           sessionId: chatSessionId,
         }),
@@ -650,6 +974,7 @@ function NoteDetailPage() {
               activeSession = eventPayload.sessionId
               setChatSessionId(eventPayload.sessionId)
             }
+            setActivity((current) => current.filter((entry) => entry.message !== 'Wrapping up reply…'))
             setChatMessages((current) => [
               ...current,
               {
@@ -688,6 +1013,18 @@ function NoteDetailPage() {
     }
   }
 
+  function clearChat() {
+    streamAbortRef.current?.abort()
+    const storageSlug = note?.relativePath || slug
+    setChatInput('')
+    setChatMessages([])
+    setActivity([])
+    setChatSessionId(null)
+    setChatError(null)
+    setIsSending(false)
+    if (storageSlug && typeof window !== 'undefined') window.localStorage.removeItem(chatStorageKey(storageSlug))
+  }
+
   return (
     <main className="app-shell detail-shell">
       <LifeOsChrome />
@@ -700,7 +1037,7 @@ function NoteDetailPage() {
           <header className="note-detail-header">
             <div className="note-topbar-title">
               <h1>{note.title}</h1>
-              {note.updated ? <p>Updated {note.updated}</p> : null}
+              {note.updated ? <p>Updated {formatDashboardDate(note.updated)}</p> : null}
             </div>
             <div className="note-topbar-actions">
               <button
@@ -709,9 +1046,7 @@ function NoteDetailPage() {
                 onClick={() => (isChatOpen ? closeChatModal() : openChatModal())}
                 aria-label={isChatOpen ? 'Hide Hermes chat' : 'Open Hermes chat'}
               >
-                <span className="button-icon" aria-hidden="true">
-                  💬
-                </span>
+                <LifeOsLogo className="button-icon logo-button-icon" />
                 <span>Chat</span>
               </button>
               <a className="link-button compact-button note-action-button" href={note.obsidianLink} target="_blank" rel="noreferrer" aria-label={`Open ${note.title} in Obsidian`}>
@@ -748,13 +1083,14 @@ function NoteDetailPage() {
 
       {note && isChatOpen ? (
         <ChatModal
-          note={note}
+          subject={{ title: note.title, slug: note.slug, relativePath: note.relativePath }}
           input={chatInput}
           feed={chatFeed}
           isSending={isSending}
           sessionId={chatSessionId}
           error={chatError}
           onClose={closeChatModal}
+          onClear={clearChat}
           onInputChange={setChatInput}
           onSubmit={handleChatSubmit}
         />
@@ -764,33 +1100,48 @@ function NoteDetailPage() {
 }
 
 function ChatModal({
-  note,
+  subject,
   input,
   feed,
   isSending,
   sessionId,
   error,
   onClose,
+  onClear,
   onInputChange,
   onSubmit,
 }: {
-  note: NoteDetail
+  subject: ChatSubject
   input: string
   feed: ChatFeedEntry[]
   isSending: boolean
   sessionId: string | null
   error: string | null
   onClose: () => void
+  onClear: () => void
   onInputChange: (value: string) => void
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
 }) {
   const transcriptRef = useRef<HTMLDivElement | null>(null)
+  const shouldStickToBottomRef = useRef(true)
+
+  const updateTranscriptStickiness = useCallback(() => {
+    const node = transcriptRef.current
+    if (!node) return
+    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight
+    shouldStickToBottomRef.current = distanceFromBottom < 72
+  }, [])
 
   useEffect(() => {
     const node = transcriptRef.current
-    if (!node) return
+    if (!node || !shouldStickToBottomRef.current) return
     node.scrollTop = node.scrollHeight
-  }, [feed, isSending])
+  }, [feed])
+
+  const isGeneralChat = Boolean(subject.isGeneral)
+  const headerCopy = isGeneralChat ? 'Fresh chat. No note is attached — say if this is LifeOS-related and what context Hermes should use.' : `Working against ${subject.title}. Note context is attached automatically.`
+  const emptyCopy = isGeneralChat ? 'Ask anything. If it belongs in LifeOS, include the note/task/project/person context so Hermes can route it cleanly.' : 'Ask Hermes to summarize, plan, draft, or update this note.'
+  const placeholder = isGeneralChat ? 'Message Hermes…' : 'Message Hermes about this note...'
 
   return (
     <div className="chat-modal-overlay" onClick={onClose} role="presentation">
@@ -798,27 +1149,32 @@ function ChatModal({
         className="chat-modal"
         role="dialog"
         aria-modal="true"
-        aria-label={`Hermes chat for ${note.title}`}
+        aria-label={isGeneralChat ? 'Fresh Hermes chat' : `Hermes chat for ${subject.title}`}
         onClick={(event) => event.stopPropagation()}
       >
         <div className="chat-modal-header">
-          <div>
+          <div className="chat-modal-heading">
             <h2>Chat with Hermes</h2>
             <p>
-              Working against <strong>{note.title}</strong>. Note context is attached automatically.
+              {isGeneralChat ? headerCopy : <>Working against <strong>{subject.title}</strong>. Note context is attached automatically.</>}
             </p>
           </div>
           <div className="chat-modal-header-actions">
             {sessionId ? <span className="chat-session-pill">Session {sessionId}</span> : null}
+            {feed.length > 0 || sessionId || input ? (
+              <button className="chat-reset-button" type="button" onClick={onClear} disabled={isSending}>
+                New chat
+              </button>
+            ) : null}
             <button className="icon-button" type="button" onClick={onClose} aria-label="Close chat">
               ✕
             </button>
           </div>
         </div>
 
-        <div className="chat-transcript single-pane" ref={transcriptRef}>
+        <div className="chat-transcript single-pane" ref={transcriptRef} onScroll={updateTranscriptStickiness}>
           {feed.length === 0 ? (
-            <p className="empty-message">Ask Hermes to summarize, plan, draft, or update this note.</p>
+            <p className="empty-message">{emptyCopy}</p>
           ) : (
             feed.map((entry) => {
               if (entry.role === 'activity') {
@@ -847,12 +1203,12 @@ function ChatModal({
           <textarea
             className="chat-input"
             rows={4}
-            placeholder="Message Hermes about this note..."
+            placeholder={placeholder}
             value={input}
             onChange={(event) => onInputChange(event.target.value)}
           />
           <div className="chat-form-footer">
-            <button className="link-button" type="submit" disabled={isSending || !input.trim()}>
+            <button className="link-button chat-submit-button" type="submit" disabled={isSending || !input.trim()}>
               {isSending ? 'Running…' : 'Send to Hermes'}
             </button>
           </div>
@@ -908,56 +1264,39 @@ function MarkdownBody({ markdown }: { markdown: string }) {
   )
 }
 
+function isActiveTask(task: Task) {
+  return task.section !== 'done' && task.section !== 'blocked'
+}
+
 function filterTasks(tasks: Task[], recurringTasks: Task[], filter: TaskFilter) {
-  const activeTasks = tasks.filter((task) => task.section !== 'done' && task.section !== 'blocked')
+  const activeTasks = tasks.filter(isActiveTask)
 
   switch (filter) {
+    case 'calendar':
+      return activeTasks.filter((task) => task.calendarBucket !== 'unscheduled')
     case 'overdue':
-      return tasks.filter((task) => task.section === 'overdue')
+      return activeTasks.filter((task) => task.section === 'overdue')
     case 'dueSoon':
-      return tasks.filter((task) => task.section === 'dueSoon')
+      return activeTasks.filter((task) => task.section === 'dueSoon')
     case 'recurring':
-      return recurringTasks.filter((task) => task.section !== 'done')
-    case 'inProgress':
-      return tasks.filter((task) => task.section === 'inProgress')
-    case 'active':
-      return tasks.filter((task) => task.section === 'active')
-    default:
+      return recurringTasks.filter(isActiveTask)
+    case 'allActive':
       return activeTasks
   }
 }
 
 function taskFilterCount(data: DashboardPayload, filter: TaskFilter) {
   switch (filter) {
+    case 'calendar':
+      return data.tasks.filter((task) => isActiveTask(task) && task.calendarBucket !== 'unscheduled').length
     case 'overdue':
       return data.summary.overdue
     case 'dueSoon':
       return data.summary.dueSoon
     case 'recurring':
       return data.summary.recurring
-    case 'inProgress':
-      return data.summary.inProgress
-    case 'active':
+    case 'allActive':
       return data.summary.active
-    default:
-      return data.tasks.filter((task) => task.section !== 'done' && task.section !== 'blocked').length
-  }
-}
-
-function taskFilterHeading(filter: TaskFilter) {
-  switch (filter) {
-    case 'overdue':
-      return 'Overdue'
-    case 'dueSoon':
-      return 'Due soon'
-    case 'recurring':
-      return 'Recurring'
-    case 'inProgress':
-      return 'In progress'
-    case 'active':
-      return 'Other active'
-    default:
-      return 'Active tasks'
   }
 }
 
@@ -979,10 +1318,12 @@ function viewToCollection(view: DashboardView): DashboardCollection {
       return 'people'
     case 'goals':
       return 'goals'
+    case 'agentNotes':
+      return 'agentNotes'
   }
 }
 
-function viewToCollectionCardsKey(view: Exclude<DashboardView, 'home' | 'tasks' | 'projects'>): Exclude<DashboardCollection, 'tasks' | 'projects'> {
+function viewToCollectionCardsKey(view: Exclude<DashboardView, 'home' | 'tasks' | 'projects' | 'agentNotes'>): Exclude<DashboardCollection, 'tasks' | 'projects' | 'agentNotes'> {
   switch (view) {
     case 'checkIns':
       return 'checkIns'
@@ -997,7 +1338,7 @@ function viewToCollectionCardsKey(view: Exclude<DashboardView, 'home' | 'tasks' 
   }
 }
 
-function collectionLabel(view: Exclude<DashboardView, 'home' | 'tasks' | 'projects'>) {
+function collectionLabel(view: Exclude<DashboardView, 'home' | 'tasks' | 'projects' | 'agentNotes'>) {
   return dashboardViews.find((entry) => entry.key === view)?.label ?? humanize(view)
 }
 
@@ -1016,11 +1357,11 @@ function TaskLens({
   tasks: Task[]
   emptyMessage: string
 }) {
-  const heading = currentView === 'home' ? 'Home' : 'Tasks'
+  const sectionLabel = currentView === 'home' ? 'Home task lens' : 'Tasks lens'
 
   return (
     <section className="content-stack">
-      <SectionCard title={heading} count={tasks.length}>
+      <SectionCard title={sectionLabel} count={tasks.length} showHeader={false}>
         <div className="filter-chip-row" role="tablist" aria-label="Task filters">
           {taskFilterOptions.map((option) => (
             <button
@@ -1035,21 +1376,50 @@ function TaskLens({
           ))}
         </div>
 
-        <div className="inline-section-head">
-          <h3>{taskFilterHeading(filter)}</h3>
-          <p>{tasks.length} item{tasks.length === 1 ? '' : 's'}</p>
-        </div>
-
-        {tasks.length === 0 ? <EmptyMessage message={emptyMessage} /> : tasks.map((task) => <TaskCard key={task.id} task={task} />)}
+        {tasks.length === 0 ? <EmptyMessage message={emptyMessage} /> : renderTaskList(tasks, filter)}
       </SectionCard>
     </section>
   )
 }
 
+function renderTaskList(tasks: Task[], filter: TaskFilter) {
+  if (filter !== 'calendar') return tasks.map((task) => <TaskCard key={task.id} task={task} />)
+
+  const bucketOptions: Array<{ key: CalendarBucket; label: string; defaultOpen?: boolean }> = [
+    { key: 'today', label: 'Today', defaultOpen: true },
+    { key: 'tomorrow', label: 'Tomorrow', defaultOpen: true },
+    { key: 'upcomingWeek', label: 'Upcoming week', defaultOpen: true },
+    { key: 'oneToThreeWeeks', label: '1–3 weeks', defaultOpen: true },
+    { key: 'moreThanMonth', label: 'More than a month' },
+  ]
+
+  return bucketOptions.map((bucket) => {
+    const bucketTasks = tasks.filter((task) => task.calendarBucket === bucket.key)
+    if (bucketTasks.length === 0) return null
+
+    return (
+      <details key={bucket.key} className="calendar-bucket" open={bucket.defaultOpen}>
+        <summary>
+          <span>{bucket.label}</span>
+          <span className="calendar-bucket-summary-actions">
+            <strong>{bucketTasks.length}</strong>
+            <span className="collapse-indicator" aria-hidden="true" />
+          </span>
+        </summary>
+        <div className="calendar-bucket-list">
+          {bucketTasks.map((task) => (
+            <TaskCard key={task.id} task={task} />
+          ))}
+        </div>
+      </details>
+    )
+  })
+}
+
 function ProjectsView({ projects }: { projects: Project[] }) {
   return (
     <section className="content-stack">
-      <SectionCard title="Projects" count={projects.length}>
+      <SectionCard title="Projects" count={projects.length} showHeader={false}>
         {projects.length === 0 ? (
           <EmptyMessage message="No active projects found." />
         ) : (
@@ -1060,12 +1430,47 @@ function ProjectsView({ projects }: { projects: Project[] }) {
   )
 }
 
+
+function AgentNotesView({ agentNotes }: { agentNotes: AgentNotesPayload }) {
+  if (!agentNotes.enabled) {
+    return (
+      <section className="content-stack">
+        <SectionCard title={agentNotes.label} count={0} showHeader={false}>
+          <EmptyMessage message="Agent Notes is disabled in dashboard config." />
+        </SectionCard>
+      </section>
+    )
+  }
+
+  return (
+    <section className="content-stack agent-notes-stack">
+      <SectionCard title={agentNotes.label} count={agentNotes.count} showHeader={false}>
+        {agentNotes.sections.length === 0 ? <EmptyMessage message="No agent note sections configured." /> : null}
+        {agentNotes.sections.map((section, index) => (
+          <details key={section.id} className="agent-note-section calendar-bucket" open={index === 0}>
+            <summary>
+              <span>{section.label}</span>
+              <span className="calendar-bucket-summary-actions">
+                <strong>{section.notes.length}</strong>
+                <span className="collapse-indicator" aria-hidden="true" />
+              </span>
+            </summary>
+            <div className="calendar-bucket-list">
+              {section.notes.length === 0 ? <EmptyMessage message="No files matched this config section." /> : section.notes.map((note) => <CollectionNoteCard key={note.id} note={note} />)}
+            </div>
+          </details>
+        ))}
+      </SectionCard>
+    </section>
+  )
+}
+
 function DefaultCollectionView({
   view,
   count,
   notes,
 }: {
-  view: Exclude<DashboardView, 'home' | 'tasks' | 'projects'>
+  view: Exclude<DashboardView, 'home' | 'tasks' | 'projects' | 'agentNotes'>
   count: number
   notes: CollectionNote[]
 }) {
@@ -1073,7 +1478,7 @@ function DefaultCollectionView({
 
   return (
     <section className="content-stack">
-      <SectionCard title={label} count={count}>
+      <SectionCard title={label} count={count} showHeader={false}>
         {notes.length === 0 ? <EmptyMessage message={`No ${label.toLowerCase()} found.`} /> : notes.map((note) => <CollectionNoteCard key={note.id} note={note} />)}
       </SectionCard>
     </section>
@@ -1089,17 +1494,19 @@ function StateCard({ title, body, tone = 'neutral' }: { title: string; body: str
   )
 }
 
-const SectionCard = forwardRef<HTMLElement, { title: string; count: number; children: React.ReactNode; highlighted?: boolean; subtitle?: string }>(
-  function SectionCard({ title, count, children, highlighted = false, subtitle }, ref) {
+const SectionCard = forwardRef<HTMLElement, { title: string; count: number; children: React.ReactNode; highlighted?: boolean; subtitle?: string; showHeader?: boolean }>(
+  function SectionCard({ title, count, children, highlighted = false, subtitle, showHeader = true }, ref) {
     return (
-      <section className={highlighted ? 'section-card highlighted-section' : 'section-card'} ref={ref}>
-        <div className="section-header">
-          <div>
-            <h2>{title}</h2>
-            <p>{count} item{count === 1 ? '' : 's'}</p>
+      <section className={highlighted ? 'section-card highlighted-section' : 'section-card'} ref={ref} aria-label={title}>
+        {showHeader ? (
+          <div className="section-header">
+            <div>
+              <h2>{title}</h2>
+              <p>{count} item{count === 1 ? '' : 's'}</p>
+            </div>
+            {subtitle ? <p className="section-subtitle">{subtitle}</p> : null}
           </div>
-          {subtitle ? <p className="section-subtitle">{subtitle}</p> : null}
-        </div>
+        ) : null}
         <div className="section-body">{children}</div>
       </section>
     )
@@ -1111,16 +1518,18 @@ function EmptyMessage({ message }: { message: string }) {
 }
 
 function CollectionNoteCard({ note }: { note: CollectionNote }) {
+  const notePath = note.appPath || `/note/${note.slug}`
+
   return (
-    <article className="item-card">
+    <article className="item-card with-card-chat-action">
       <div className="item-topline">
         <div className="item-heading-group">
           <div className="item-title-row">
-            <Link className="item-title-link" to={`/note/${note.slug}`}>
+            <Link className="item-title-link" to={notePath}>
               <h3>{note.title}</h3>
             </Link>
           </div>
-          <p className="subtle-text">{humanize(note.folder)}</p>
+          <p className="subtle-text">{note.relativePath || humanize(note.folder)}</p>
         </div>
         {note.status ? <Badge>{note.status}</Badge> : null}
       </div>
@@ -1132,27 +1541,29 @@ function CollectionNoteCard({ note }: { note: CollectionNote }) {
         ))}
       </div>
 
-      <dl className="meta-list">
-        <div>
-          <dt>Updated</dt>
-          <dd>{note.updated || 'Unknown'}</dd>
-        </div>
-      </dl>
+      <div className="card-footer-row">
+        <dl className="meta-list">
+          <div>
+            <dt>Updated</dt>
+            <dd>{formatDashboardDate(note.updated) || 'Unknown'}</dd>
+          </div>
+        </dl>
+        <CardChatLink to={withChatParam(notePath)} title={note.title} />
+      </div>
     </article>
   )
 }
 
 function TaskCard({ task }: { task: Task }) {
+  const timingLabel = taskTimingLabel(task)
+
   return (
-    <article className="item-card">
+    <article className="item-card with-card-chat-action">
       <div className="item-topline">
         <div className="item-heading-group">
           <div className="item-title-row">
             <Link className="item-title-link" to={`/note/${task.slug}`}>
               <h3>{task.title}</h3>
-            </Link>
-            <Link className="mini-icon-button" to={`/note/${task.slug}?chat=1`} aria-label={`Chat about ${task.title}`} title="Chat about this note">
-              💬
             </Link>
           </div>
           <p className="subtle-text">{task.project ? `Project: ${humanize(task.project)}` : 'Standalone task'}</p>
@@ -1162,40 +1573,57 @@ function TaskCard({ task }: { task: Task }) {
 
       <div className="chip-row">
         {task.priority ? <Chip>{task.priority.toUpperCase()}</Chip> : null}
+        {task.status === 'in-progress' ? <Chip>In progress</Chip> : null}
+        {task.section === 'overdue' ? <Chip>Overdue</Chip> : null}
         {task.area ? <Chip>{task.area}</Chip> : null}
         {task.energyRequired ? <Chip>{task.energyRequired} energy</Chip> : null}
         {task.timeRequired ? <Chip>{task.timeRequired}</Chip> : null}
         {task.recurrence ? <Chip>{task.recurrence}</Chip> : null}
       </div>
 
-      <dl className="meta-list">
-        <div>
-          <dt>Due</dt>
-          <dd>{task.dueDate || task.nextReminderTime || 'No due date'}</dd>
-        </div>
-        <div>
-          <dt>Updated</dt>
-          <dd>{task.updated || 'Unknown'}</dd>
-        </div>
-      </dl>
+      <div className="card-footer-row">
+        <dl className="meta-list">
+          <div>
+            <dt>Next action</dt>
+            <dd>{timingLabel}</dd>
+          </div>
+          {task.dueDate && task.dateBasis !== 'due' ? (
+            <div>
+              <dt>Due</dt>
+              <dd>{formatDashboardDate(task.dueDate)}</dd>
+            </div>
+          ) : null}
+          <div>
+            <dt>Updated</dt>
+            <dd>{formatDashboardDate(task.updated) || 'Unknown'}</dd>
+          </div>
+        </dl>
+        <CardChatLink to={`/note/${task.slug}?chat=1`} title={task.title} />
+      </div>
     </article>
   )
 }
 
+function taskTimingLabel(task: Task) {
+  const formatted = task.nextActionAt ? formatDashboardDate(task.nextActionAt) : ''
+  if (!formatted) return 'No scheduled action'
+  if (task.section === 'overdue') return `Overdue · ${formatted}`
+  if (task.dateBasis === 'due') return `Due · ${formatted}`
+  if (task.dateBasis === 'reminder') return `Reminder · ${formatted}`
+  return formatted
+}
+
 function ProjectCard({ project }: { project: Project }) {
   return (
-    <article className="item-card project-card">
+    <article className="item-card project-card with-card-chat-action">
       <div className="item-topline">
         <div className="item-heading-group">
           <div className="item-title-row">
             <Link className="item-title-link" to={`/note/${project.slug}`}>
               <h3>{project.title}</h3>
             </Link>
-            <Link className="mini-icon-button" to={`/note/${project.slug}?chat=1`} aria-label={`Chat about ${project.title}`} title="Chat about this note">
-              💬
-            </Link>
           </div>
-          <p className="subtle-text">{project.updated ? `Updated ${project.updated}` : 'Active project'}</p>
+          <p className="subtle-text">{project.updated ? `Updated ${formatDashboardDate(project.updated)}` : 'Active project'}</p>
         </div>
         <Badge>{project.status || 'active'}</Badge>
       </div>
@@ -1203,7 +1631,7 @@ function ProjectCard({ project }: { project: Project }) {
       <div className="chip-row">
         {project.priority ? <Chip>{project.priority.toUpperCase()}</Chip> : null}
         {project.area ? <Chip>{project.area}</Chip> : null}
-        {project.targetDate ? <Chip>Target {project.targetDate}</Chip> : null}
+        {project.targetDate ? <Chip>Target {formatDashboardDate(project.targetDate)}</Chip> : null}
         {project.tags.slice(0, 3).map((tag) => (
           <Chip key={tag}>#{tag}</Chip>
         ))}
@@ -1216,34 +1644,51 @@ function ProjectCard({ project }: { project: Project }) {
         <StatBubble label="In progress" value={project.inProgressTaskCount} accent="info" />
       </div>
 
-      <div className="next-action-card">
-        <span className="next-action-label">Next likely action</span>
-        {project.nextAction ? (
-          <div className="next-action-body">
-            <Link className="inline-link" to={`/note/${project.nextAction.slug}`}>
-              {project.nextAction.title}
-            </Link>
-            <p className="subtle-text">{project.nextAction.dueDate || humanize(project.nextAction.section)}</p>
+      <div className="card-footer-row">
+        <div className="card-footer-content">
+          <div className="next-action-card">
+            <span className="next-action-label">Next likely action</span>
+            {project.nextAction ? (
+              <div className="next-action-body">
+                <Link className="inline-link" to={`/note/${project.nextAction.slug}`}>
+                  {project.nextAction.title}
+                </Link>
+                <p className="subtle-text">{formatDashboardDate(project.nextAction.nextActionAt || project.nextAction.dueDate) || humanize(project.nextAction.section)}</p>
+              </div>
+            ) : (
+              <p>No clear next action yet. Which usually means the project note needs some love.</p>
+            )}
           </div>
-        ) : (
-          <p>No clear next action yet. Which usually means the project note needs some love.</p>
-        )}
-      </div>
 
-      {project.taskPreview.length > 0 ? (
-        <div className="compact-list">
-          {project.taskPreview.map((task) => (
-            <div key={task.id} className="compact-list-row">
-              <Link className="inline-link compact-link" to={`/note/${task.slug}`}>
-                {task.title}
-              </Link>
-              <span>{task.dueDate || humanize(task.section)}</span>
+          {project.taskPreview.length > 0 ? (
+            <div className="compact-list">
+              {project.taskPreview.map((task) => (
+                <div key={task.id} className="compact-list-row">
+                  <Link className="inline-link compact-link" to={`/note/${task.slug}`}>
+                    {task.title}
+                  </Link>
+                  <span>{formatDashboardDate(task.nextActionAt || task.dueDate) || humanize(task.section)}</span>
+                </div>
+              ))}
             </div>
-          ))}
+          ) : null}
         </div>
-      ) : null}
+        <CardChatLink to={`/note/${project.slug}?chat=1`} title={project.title} />
+      </div>
     </article>
   )
+}
+
+function CardChatLink({ to, title }: { to: string; title: string }) {
+  return (
+    <Link className="mini-icon-button card-chat-action" to={to} aria-label={`Chat about ${title}`} title="Chat about this note">
+      <LifeOsLogo className="mini-logo-mark" />
+    </Link>
+  )
+}
+
+function withChatParam(path: string) {
+  return path.includes('?') ? `${path}&chat=1` : `${path}?chat=1`
 }
 
 function StatBubble({

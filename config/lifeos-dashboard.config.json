@@ -1,0 +1,24 @@
+{
+  "agentNotes": {
+    "enabled": true,
+    "label": "Agent Notes",
+    "sections": [
+      {
+        "id": "agent-tasks",
+        "label": "Agent Tasks",
+        "paths": [
+          "tasks/run-nightly-life-os-lint.md",
+          "tasks/run-daily-reminder-safety-net.md",
+          "tasks/get-inspired.md"
+        ]
+      },
+      {
+        "id": "agent-logs",
+        "label": "Agent Logs",
+        "paths": [
+          ".agents-log/**/*.md"
+        ]
+      }
+    ]
+  }
+}

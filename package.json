@@ -10,7 +10,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "serve": "tsx server/index.ts"
+    "serve": "tsx server/index.ts",
+    "test": "tsx src/dateFormat.test.ts && tsx server/taskTiming.test.ts"
   },
   "dependencies": {
     "chrono-node": "^2.9.0",
