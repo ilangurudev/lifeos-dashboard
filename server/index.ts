@@ -14,6 +14,19 @@ import {
   type TaskSection,
   type TaskTiming,
 } from './taskTiming.ts'
+import {
+  classifyHermesLine,
+  cleanHermesLine,
+  formatHermesActivityLine,
+  parseToolCall,
+  shouldShowHermesLine,
+  stripAnsi,
+  summarizeToolCall,
+  truncateActivityMessage,
+  type HermesActivityKind,
+} from './hermesActivity.ts'
+import { chooseHermesFinalReply, readHermesSessionReply, type HermesSessionFile } from './hermesSession.ts'
+import { buildSearchIndex, searchNotes, type SearchIndex, type SearchIndexSourceNote } from './searchIndex.ts'
 
 const app = express()
 const port = Number(process.env.PORT || 3007)
@@ -34,19 +47,11 @@ const COLLECTION_GLOBS = {
   journal: 'journal/*.md',
 } as const
 const NOTE_FOLDERS = ['tasks', 'projects', 'notes', 'people', 'goals', 'check-ins', 'journal'] as const
-// eslint-disable-next-line no-control-regex
-const ANSI_REGEX = new RegExp('\\u001B\\[[0-9;?]*[ -/]*[@-~]', 'g')
 const HERMES_SESSION_REGEX = /(\d{8}_\d{6}_[a-z0-9]+)/i
-
-const HERMES_LOG_PATTERNS: Array<{ kind: HermesActivityKind; test: (line: string) => boolean }> = [
-  { kind: 'tool_call', test: (line) => line.includes('Tool call:') || line.includes('📞 Tool') },
-  { kind: 'tool_result', test: (line) => /Tool .* completed/.test(line) || line.includes('✅ Tool') || line.includes('Result:') },
-  { kind: 'thinking', test: (line) => line.includes('API Request') || line.includes('API Response') || line.includes('API call #') },
-  { kind: 'status', test: (line) => line.includes('Starting conversation') || line.includes('Initializing agent') || line.includes('conversation turn:') || line.includes('Turn ended:') },
-]
+const SEARCH_INDEX_TTL_MS = 30_000
+const SEARCH_NOTE_GLOBS = ['tasks/*.md', 'projects/*.md', 'notes/*.md', 'people/*.md', 'goals/*.md', 'check-ins/*.md', 'journal/*.md', '.agents-log/**/*.md']
 
 type NoteFolder = (typeof NOTE_FOLDERS)[number] | string
-type HermesActivityKind = 'status' | 'thinking' | 'tool_call' | 'tool_result' | 'log'
 type CollectionKey = keyof typeof COLLECTION_GLOBS
 
 type AgentNotesConfigSection = {
@@ -184,21 +189,6 @@ type HermesChatResponse = {
   reply: string
 }
 
-type HermesSessionFile = {
-  messages?: Array<{
-    role?: string
-    content?: string
-    tool_calls?: Array<{
-      id?: string
-      call_id?: string
-      function?: {
-        name?: string
-        arguments?: string
-      }
-    }>
-  }>
-}
-
 type HermesChatMessage = {
   role: 'user' | 'assistant'
   content: string
@@ -233,6 +223,8 @@ type HermesStreamEvent =
   | { type: 'error'; message: string }
 
 const hermesRuntimeSessions = new Map<string, HermesRuntimeSession>()
+let cachedSearchIndex: { index: SearchIndex; loadedAt: number } | null = null
+let searchIndexBuildPromise: Promise<SearchIndex> | null = null
 
 function readTitle(content: string, fallback: string) {
   const match = content.match(/^#\s+(.+)$/m)
@@ -398,57 +390,12 @@ function parseHermesOutput(output: string): HermesChatResponse {
   return { sessionId, reply }
 }
 
-function looksLikeUselessReply(reply: string) {
-  const normalized = reply.trim()
-  if (!normalized) return true
-
-  return [
-    normalized.includes('Turn ended:'),
-    normalized.includes('API Request'),
-    normalized.includes('API Response'),
-    normalized.includes('API call #'),
-    normalized.includes('last_msg_role='),
-    normalized.includes('response_len='),
-    normalized.startsWith('session='),
-  ].some(Boolean)
-}
-
 function cleanHermesSessionUserMessage(content: string) {
   const marker = 'User message:'
   const markerIndex = content.lastIndexOf(marker)
   if (markerIndex === -1) return content.trim()
 
   return content.slice(markerIndex + marker.length).trim()
-}
-
-function stripAnsi(value: string) {
-  return value.replace(ANSI_REGEX, '').replace(/\r/g, '')
-}
-
-function cleanHermesLine(value: string) {
-  return stripAnsi(value)
-    .replace(/[\u2800-\u28FF]/g, '')
-    .replace(/^\s*│\s?/, '')
-    .trimEnd()
-}
-
-function shouldShowHermesLine(line: string) {
-  if (!line.trim()) return false
-
-  return [
-    line.startsWith('Initializing agent'),
-    line.includes('API Request'),
-    line.includes('Tool call:'),
-    /Tool .* completed/.test(line),
-    line.includes('Turn ended:'),
-  ].some(Boolean)
-}
-
-function classifyHermesLine(line: string): HermesActivityKind {
-  for (const pattern of HERMES_LOG_PATTERNS) {
-    if (pattern.test(line)) return pattern.kind
-  }
-  return 'log'
 }
 
 function writeNdjson(res: express.Response, payload: HermesStreamEvent) {
@@ -475,81 +422,6 @@ function rememberHermesRuntimeSession(sessionId: string, updates: Partial<Hermes
   return next
 }
 
-function truncateActivityMessage(line: string, maxLength = 220) {
-  if (line.length <= maxLength) return line
-  return `${line.slice(0, maxLength - 1)}…`
-}
-
-function shortPath(value: string) {
-  return value.replace(/^\/home\/ilangurudev\/my-data\//, '').replace(/^\/home\/ilangurudev\/projects\/lifeos-dashboard\//, '')
-}
-
-function compactJsonValue(value: unknown): string | null {
-  if (typeof value === 'string') return value.trim() || null
-  if (Array.isArray(value)) return value.map(compactJsonValue).filter(Boolean).join(', ') || null
-  if (value && typeof value === 'object') return JSON.stringify(value)
-  if (value === null || typeof value === 'undefined') return null
-  return String(value)
-}
-
-function parseToolCall(line: string): { tool: string; args: Record<string, unknown> } | null {
-  const match = line.match(/Tool call:\s*([^\s]+)(?:\s+with args:\s*([\s\S]+))?/)
-  if (!match?.[1]) return null
-
-  const rawArgs = match[2]?.trim()
-  if (!rawArgs) return { tool: match[1], args: {} }
-
-  try {
-    return { tool: match[1], args: JSON.parse(rawArgs) as Record<string, unknown> }
-  } catch {
-    return { tool: match[1], args: { raw: rawArgs } }
-  }
-}
-
-function summarizeToolCall(tool: string, args: Record<string, unknown>) {
-  const pathValue = compactJsonValue(args.path) || compactJsonValue(args.file_path) || compactJsonValue(args.target)
-  const queryValue = compactJsonValue(args.query) || compactJsonValue(args.pattern)
-  const commandValue = compactJsonValue(args.command)
-  const urlValue = compactJsonValue(args.url) || compactJsonValue(args.urls)
-
-  if (tool === 'read_file' && pathValue) return `Reading ${shortPath(pathValue)}…`
-  if (tool === 'search_files') {
-    const scope = pathValue ? ` in ${shortPath(pathValue)}` : ''
-    return queryValue ? `Searching for “${truncateActivityMessage(queryValue, 80)}”${scope}…` : `Searching files${scope}…`
-  }
-  if (tool === 'terminal' && commandValue) return `Running ${truncateActivityMessage(commandValue, 110)}…`
-  if (tool === 'web_search' && queryValue) return `Searching web for “${truncateActivityMessage(queryValue, 90)}”…`
-  if (tool === 'web_extract' && urlValue) return `Reading ${truncateActivityMessage(urlValue, 110)}…`
-  if (tool === 'browser_navigate' && urlValue) return `Opening ${truncateActivityMessage(urlValue, 110)}…`
-  if (queryValue) return `Using ${tool} for “${truncateActivityMessage(queryValue, 90)}”…`
-  if (pathValue) return `Using ${tool} on ${shortPath(pathValue)}…`
-  return `Using ${tool}…`
-}
-
-function formatHermesActivityLine(line: string, recentToolLabels: Map<string, string>): string | null {
-  if (line.startsWith('Initializing agent')) return 'Initializing Hermes…'
-  if (line.includes('API Request')) return 'Asking the model…'
-  if (line.includes('📞 Tool') || line.includes('✅ Tool')) return null
-
-  const toolCall = parseToolCall(line)
-  if (toolCall) {
-    const label = summarizeToolCall(toolCall.tool, toolCall.args)
-    recentToolLabels.set(toolCall.tool, label)
-    return label
-  }
-
-  const toolDoneMatch = line.match(/Tool\s+([^\s]+)\s+completed\s+in\s+([0-9.]+s)/)
-  if (toolDoneMatch?.[1]) {
-    const previousLabel = recentToolLabels.get(toolDoneMatch[1])
-    const target = previousLabel ? previousLabel.replace(/…$/, '').replace(/^(Reading|Searching|Running|Opening|Using)\s+/i, '') : toolDoneMatch[1]
-    return `Finished ${target} in ${toolDoneMatch[2]}`
-  }
-
-  if (line.includes('Turn ended:')) return 'Wrapping up reply…'
-
-  return null
-}
-
 function parseHermesFinalReply(output: string) {
   const cleaned = stripAnsi(output)
   const boxMatch = cleaned.match(/Turn ended:.*?\n([\s\S]*?)\n╰/)
@@ -573,28 +445,6 @@ function parseHermesFinalReply(output: string) {
     .pop()
 
   return fallback || ''
-}
-
-async function readHermesSessionReply(sessionId: string | null) {
-  if (!sessionId) return ''
-
-  try {
-    const sessionPath = path.join(process.env.HOME || '', '.hermes', 'sessions', `session_${sessionId}.json`)
-    const raw = await fs.readFile(sessionPath, 'utf8')
-    const session = JSON.parse(raw) as HermesSessionFile
-    const messages = session.messages ?? []
-
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index]
-      if (message.role === 'assistant' && typeof message.content === 'string' && message.content.trim()) {
-        return message.content.trim()
-      }
-    }
-  } catch {
-    return ''
-  }
-
-  return ''
 }
 
 async function readHermesSessionToolLabel(sessionId: string | null, toolName: string, seenToolCallIds: Set<string>) {
@@ -757,6 +607,52 @@ async function readMarkdownFile(filePath: string) {
     relativePath,
     title: readTitle(content, slug),
   }
+}
+
+async function buildVaultSearchIndex() {
+  const files = await fg(SEARCH_NOTE_GLOBS, {
+    cwd: lifeOsRoot,
+    absolute: true,
+    onlyFiles: true,
+    ignore: ['**/_template.md'],
+  })
+
+  const notes = await Promise.all(
+    files.map(async (filePath): Promise<SearchIndexSourceNote | null> => {
+      try {
+        const [note, stats] = await Promise.all([readMarkdownFile(filePath), fs.stat(filePath)])
+        if (!isSafeVaultRelativePath(note.relativePath)) return null
+        return {
+          slug: note.slug,
+          title: note.title,
+          folder: note.folder,
+          relativePath: note.relativePath,
+          body: note.content,
+          updated: String(note.data.updated ?? '').trim() || stats.mtime.toISOString(),
+        }
+      } catch (error) {
+        console.warn(`Skipping note while building search index: ${filePath}`, error)
+        return null
+      }
+    }),
+  )
+
+  return buildSearchIndex(notes.filter((note): note is SearchIndexSourceNote => note !== null))
+}
+
+async function getSearchIndex() {
+  const now = Date.now()
+  if (cachedSearchIndex && now - cachedSearchIndex.loadedAt < SEARCH_INDEX_TTL_MS) return cachedSearchIndex.index
+  if (!searchIndexBuildPromise) {
+    searchIndexBuildPromise = buildVaultSearchIndex().then((index) => {
+      cachedSearchIndex = { index, loadedAt: Date.now() }
+      return index
+    }).finally(() => {
+      searchIndexBuildPromise = null
+    })
+  }
+
+  return searchIndexBuildPromise
 }
 
 async function resolveAgentTaskExclusionPaths(config: AgentNotesConfig) {
@@ -1077,6 +973,21 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, lifeOsRoot })
 })
 
+app.get('/api/search', async (req, res) => {
+  try {
+    const query = String(req.query.q ?? '').trim()
+    const limit = Math.min(Math.max(Number(req.query.limit) || 5, 1), 10)
+    if (!query) return res.json({ query, results: [] })
+
+    const index = await getSearchIndex()
+    res.setHeader('Cache-Control', 'no-store')
+    res.json({ query, results: searchNotes(index, query, limit), builtAt: index.builtAt })
+  } catch (error) {
+    console.error(error)
+    res.status(500).json({ error: 'Failed to search notes.' })
+  }
+})
+
 app.use(express.json({ limit: '1mb' }))
 
 app.get('/api/dashboard', async (_req, res) => {
@@ -1196,8 +1107,6 @@ app.post('/api/hermes/chat/stream', async (req, res) => {
   res.setHeader('Connection', 'keep-alive')
   res.flushHeaders()
 
-  writeNdjson(res, { type: 'status', message: sessionId ? 'Resuming Hermes session…' : 'Starting Hermes session…' })
-
   const args = ['chat', '-v', '--source', 'tool', '--pass-session-id', '-s', 'life-os']
   if (sessionId) {
     args.push('--resume', sessionId)
@@ -1219,7 +1128,6 @@ app.post('/api/hermes/chat/stream', async (req, res) => {
   let activeSessionId = sessionId || null
   let stdoutBuffer = ''
   let stderrBuffer = ''
-  let clientConnected = true
   const recentToolLabels = new Map<string, string>()
   const seenToolCallIds = new Set<string>()
 
@@ -1276,10 +1184,6 @@ app.post('/api/hermes/chat/stream', async (req, res) => {
   child.stdout.on('data', (chunk) => handleChunk(chunk, 'stdout'))
   child.stderr.on('data', (chunk) => handleChunk(chunk, 'stderr'))
 
-  req.on('close', () => {
-    clientConnected = false
-  })
-
   child.on('error', (error) => {
     if (activeSessionId) {
       rememberHermesRuntimeSession(activeSessionId, {
@@ -1289,7 +1193,7 @@ app.post('/api/hermes/chat/stream', async (req, res) => {
       })
     }
     writeNdjson(res, { type: 'error', message: error.message || 'Hermes failed to start.' })
-    if (clientConnected && !res.writableEnded) res.end()
+    if (!res.writableEnded && !res.destroyed) res.end()
   })
 
   child.on('close', async (code) => {
@@ -1304,11 +1208,8 @@ app.post('/api/hermes/chat/stream', async (req, res) => {
     }
 
     if (code === 0) {
-      let finalReply = parsed.reply
-      if (looksLikeUselessReply(finalReply)) {
-        const sessionReply = await readHermesSessionReply(parsed.sessionId ?? activeSessionId)
-        if (sessionReply) finalReply = sessionReply
-      }
+      const sessionReply = await readHermesSessionReply(parsed.sessionId ?? activeSessionId)
+      const finalReply = chooseHermesFinalReply(parsed.reply, sessionReply)
 
       if (activeSessionId) {
         rememberHermesRuntimeSession(activeSessionId, {
@@ -1339,7 +1240,7 @@ app.post('/api/hermes/chat/stream', async (req, res) => {
       })
     }
 
-    if (clientConnected && !res.writableEnded) res.end()
+    if (!res.writableEnded && !res.destroyed) res.end()
   })
 })
 
@@ -1370,4 +1271,5 @@ app.use(async (req, res, next) => {
 app.listen(port, '0.0.0.0', () => {
   console.log(`LifeOS dashboard running on http://0.0.0.0:${port}`)
   console.log(`Using vault at ${lifeOsRoot}`)
+  void getSearchIndex().catch((error) => console.warn('Search index warmup failed:', error))
 })

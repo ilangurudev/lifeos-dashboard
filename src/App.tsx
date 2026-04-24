@@ -1,8 +1,10 @@
 import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 import { BrowserRouter, Link, NavLink, Route, Routes, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { formatDashboardDate } from './dateFormat'
+import { internalNotePathFromHref } from './markdownLinks'
 import './index.css'
 
 type TaskSection = 'overdue' | 'dueSoon' | 'blocked' | 'active' | 'done'
@@ -196,6 +198,15 @@ type StoredChatState = {
   isSending: boolean
 }
 
+type SearchResult = {
+  slug: string
+  title: string
+  folder: string
+  relativePath: string
+  appPath: string
+  updated: string
+}
+
 const taskFilterOptions: Array<{ key: TaskFilter; label: string; empty: string }> = [
   { key: 'calendar', label: 'Calendar', empty: 'No scheduled tasks found.' },
   { key: 'overdue', label: 'Overdue', empty: 'No overdue tasks.' },
@@ -218,6 +229,9 @@ const dashboardViews: Array<{ key: DashboardView; label: string; collection?: Da
 
 const VISIBLE_FRONTMATTER_KEYS = new Set(['type', 'status', 'updated', 'tags', 'project'])
 const CHAT_STORAGE_PREFIX = 'lifeos-chat:'
+const THEME_STORAGE_KEY = 'lifeos-theme'
+
+type ThemeMode = 'light' | 'dark'
 
 function App() {
   return (
@@ -352,10 +366,14 @@ function LifeOsChrome({
           <LifeOsLogo className="site-logo" />
           <h1>LifeOS</h1>
         </Link>
-        <Link className="header-chat-link" to="/chat" aria-label="Start a fresh Hermes chat">
-          <LifeOsLogo className="chat-logo-mark" />
-          <span>Chat</span>
-        </Link>
+        <div className="header-actions">
+          <ThemeToggle />
+          <HeaderSearch />
+          <Link className="header-chat-link" to="/chat" aria-label="Start a fresh Hermes chat">
+            <LifeOsLogo className="chat-logo-mark" />
+            <span>Chat</span>
+          </Link>
+        </div>
       </header>
 
       <nav className="view-switcher" aria-label="LifeOS views">
@@ -381,6 +399,182 @@ function LifeOsChrome({
           )
         })}
       </nav>
+    </div>
+  )
+}
+
+function getInitialTheme(): ThemeMode {
+  if (typeof window === 'undefined') return 'light'
+
+  const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY)
+  if (storedTheme === 'light' || storedTheme === 'dark') return storedTheme
+
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function applyTheme(theme: ThemeMode) {
+  document.documentElement.dataset.theme = theme
+  document.documentElement.style.colorScheme = theme
+}
+
+function ThemeToggle() {
+  const [theme, setTheme] = useState<ThemeMode>(getInitialTheme)
+  const isDark = theme === 'dark'
+
+  useEffect(() => {
+    applyTheme(theme)
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme)
+  }, [theme])
+
+  return (
+    <button
+      className="theme-toggle"
+      type="button"
+      aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+      title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+      aria-pressed={isDark}
+      onClick={() => setTheme(isDark ? 'light' : 'dark')}
+    >
+      <svg aria-hidden="true" viewBox="0 0 24 24" className="theme-toggle-icon">
+        {isDark ? (
+          <>
+            <circle cx="12" cy="12" r="4.4" />
+            <path d="M12 2.8v2.1M12 19.1v2.1M4.8 4.8l1.5 1.5M17.7 17.7l1.5 1.5M2.8 12h2.1M19.1 12h2.1M4.8 19.2l1.5-1.5M17.7 6.3l1.5-1.5" />
+          </>
+        ) : (
+          <path d="M20.1 14.2A7.7 7.7 0 0 1 9.8 3.9 8.6 8.6 0 1 0 20.1 14.2Z" />
+        )}
+      </svg>
+    </button>
+  )
+}
+
+function HeaderSearch() {
+  const [isOpen, setIsOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const [results, setResults] = useState<SearchResult[]>([])
+  const [isSearching, setIsSearching] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  const containerRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!isOpen) return undefined
+    const focusId = window.requestAnimationFrame(() => inputRef.current?.focus({ preventScroll: true }))
+    return () => window.cancelAnimationFrame(focusId)
+  }, [isOpen])
+
+  useEffect(() => {
+    if (!isOpen) return undefined
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!containerRef.current?.contains(event.target as Node)) setIsOpen(false)
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsOpen(false)
+    }
+
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [isOpen])
+
+  useEffect(() => {
+    const trimmed = query.trim()
+    if (!isOpen || trimmed.length < 2) {
+      return undefined
+    }
+
+    const abortController = new AbortController()
+    const timeoutId = window.setTimeout(async () => {
+      try {
+        setIsSearching(true)
+        const response = await fetch(`/api/search?q=${encodeURIComponent(trimmed)}&limit=5`, { signal: abortController.signal })
+        if (!response.ok) throw new Error('Search failed')
+        const payload = (await response.json()) as { results?: SearchResult[] }
+        setResults(payload.results ?? [])
+        setError(null)
+      } catch (err) {
+        if (!abortController.signal.aborted) {
+          setError(err instanceof Error ? err.message : 'Search failed')
+          setResults([])
+        }
+      } finally {
+        if (!abortController.signal.aborted) setIsSearching(false)
+      }
+    }, 80)
+
+    return () => {
+      window.clearTimeout(timeoutId)
+      abortController.abort()
+    }
+  }, [isOpen, query])
+
+  const trimmedQuery = query.trim()
+  const visibleResults = trimmedQuery.length >= 2 ? results : []
+  const showSearching = trimmedQuery.length >= 2 && isSearching
+
+  function handleSearchToggle() {
+    if (isOpen) {
+      setIsOpen(false)
+      return
+    }
+
+    // Mobile Safari only opens the keyboard reliably when focus happens inside
+    // the original tap/click stack. Flush the input into the DOM, then focus it.
+    flushSync(() => setIsOpen(true))
+    inputRef.current?.focus({ preventScroll: true })
+  }
+
+  return (
+    <div className={isOpen ? 'header-search open' : 'header-search'} ref={containerRef}>
+      <button
+        className="header-search-toggle"
+        type="button"
+        aria-label={isOpen ? 'Close search' : 'Search notes'}
+        aria-expanded={isOpen}
+        onClick={handleSearchToggle}
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24" className="search-icon">
+          <circle cx="10.75" cy="10.75" r="6.25" />
+          <path d="M15.4 15.4 20 20" />
+        </svg>
+      </button>
+
+      {isOpen ? (
+        <div className="header-search-popover">
+          <label className="sr-only" htmlFor="lifeos-search-input">
+            Search notes
+          </label>
+          <input
+            id="lifeos-search-input"
+            ref={inputRef}
+            className="header-search-input"
+            type="search"
+            enterKeyHint="search"
+            autoComplete="off"
+            placeholder="Search notes…"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <div className="search-suggestions" role="listbox" aria-label="Search suggestions">
+            {trimmedQuery.length < 2 ? <p className="search-empty">Type at least 2 characters.</p> : null}
+            {showSearching ? <p className="search-empty">Searching…</p> : null}
+            {error && trimmedQuery.length >= 2 ? <p className="search-empty error">{error}</p> : null}
+            {!showSearching && !error && trimmedQuery.length >= 2 && visibleResults.length === 0 ? <p className="search-empty">No matches.</p> : null}
+            {visibleResults.map((result) => (
+              <Link key={result.relativePath} className="search-result-row" to={result.appPath} role="option" onClick={() => setIsOpen(false)}>
+                <span className="search-result-title">{result.title}</span>
+                <span className="search-result-meta">{result.folder} · {result.relativePath}</span>
+              </Link>
+            ))}
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -530,7 +724,7 @@ function GeneralChatPage() {
       if (snapshot.status === 'finished') {
         setIsSending(false)
         setChatError(null)
-        if (reason !== 'poll') {
+        if (reason === 'wake' || reason === 'stream-error') {
           setActivity((current) => appendRecoveryActivity(current, 'Reconnected cleanly and loaded the finished session.'))
         }
         return
@@ -546,6 +740,14 @@ function GeneralChatPage() {
       }
     }
   }, [chatSessionId])
+
+  useEffect(() => {
+    if (!chatSessionId) return undefined
+    const timeoutId = window.setTimeout(() => {
+      void recoverChatSession('startup')
+    }, 0)
+    return () => window.clearTimeout(timeoutId)
+  }, [chatSessionId, recoverChatSession])
 
   useEffect(() => {
     if (!chatSessionId || !isSending) return undefined
@@ -588,7 +790,7 @@ function GeneralChatPage() {
     setChatMessages((current) => [...current, userMessage])
     setChatInput('')
     setChatError(null)
-    setActivity([createActivityEntry('status', 'Queued your request. Booting Hermes…')])
+    setActivity([])
     setIsSending(true)
 
     const abortController = new AbortController()
@@ -832,7 +1034,7 @@ function NoteDetailPage() {
       if (snapshot.status === 'finished') {
         setIsSending(false)
         setChatError(null)
-        if (reason === 'wake' || reason === 'stream-error' || reason === 'startup') {
+        if (reason === 'wake' || reason === 'stream-error') {
           setActivity((current) => appendRecoveryActivity(current, 'Reconnected cleanly and loaded the finished session.'))
         }
         return
@@ -853,6 +1055,14 @@ function NoteDetailPage() {
       }
     }
   }, [chatSessionId, note])
+
+  useEffect(() => {
+    if (!note || !chatSessionId) return undefined
+    const timeoutId = window.setTimeout(() => {
+      void recoverChatSession('startup')
+    }, 0)
+    return () => window.clearTimeout(timeoutId)
+  }, [chatSessionId, note, recoverChatSession])
 
   useEffect(() => {
     if (!note || !chatSessionId || !isSending) return undefined
@@ -910,7 +1120,7 @@ function NoteDetailPage() {
     setChatMessages((current) => [...current, userMessage])
     setChatInput('')
     setChatError(null)
-    setActivity([createActivityEntry('status', 'Queued your request. Booting Hermes…')])
+    setActivity([])
     setIsSending(true)
     openChatModal()
 
@@ -1243,9 +1453,10 @@ function MarkdownBody({ markdown }: { markdown: string }) {
       remarkPlugins={[remarkGfm]}
       components={{
         a: ({ href = '', children, ...props }) => {
-          if (href.startsWith('/note/')) {
+          const internalPath = internalNotePathFromHref(href, typeof window === 'undefined' ? undefined : window.location.origin)
+          if (internalPath) {
             return (
-              <NavLink className="inline-link" to={href} {...props}>
+              <NavLink className="inline-link" to={internalPath} {...props}>
                 {children}
               </NavLink>
             )

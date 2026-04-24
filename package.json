@@ -11,7 +11,7 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "serve": "tsx server/index.ts",
-    "test": "tsx src/dateFormat.test.ts && tsx server/taskTiming.test.ts"
+    "test": "tsx src/dateFormat.test.ts && tsx src/markdownLinks.test.ts && tsx server/taskTiming.test.ts && tsx server/hermesActivity.test.ts && tsx server/hermesSession.test.ts && tsx server/searchIndex.test.ts"
   },
   "dependencies": {
     "chrono-node": "^2.9.0",
